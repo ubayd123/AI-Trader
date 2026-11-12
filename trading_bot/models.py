@@ -55,6 +55,7 @@ class Order:
     reason: str
     gbp_amount: float = 0.0  # buys: cash to spend (fees included)
     qty: float = 0.0  # sells: quantity to sell
+    stop: bool = False  # sells: triggered by a stop (starts a re-entry cooldown)
 
 
 @dataclass

@@ -11,7 +11,8 @@ from .brokers import BrokerError, PositionMissing
 from .config import Config
 from .data import is_market_open
 from .models import Order, Portfolio, Snapshot
-from .strategy import candidates, circuit_breaker, entry_orders, exit_orders, update_high_water
+from .strategy import (candidates, circuit_breaker, entry_orders, exit_orders, regime_ok, start_cooldown,
+                       update_high_water)
 
 log = logging.getLogger(__name__)
 
@@ -48,12 +49,14 @@ class Engine:
             self.portfolio.apply_buy(order, fill, now.isoformat())
         else:
             pnl = self.portfolio.apply_sell(order, fill)
+            start_cooldown(self.portfolio, order, self.cfg, now.date())
         # Persist immediately: after a real order the ledger must never be lost.
         self.portfolio.save(self.cfg.state_path)
         record = {"time": now.isoformat(), "broker": self.broker.name, "side": order.side, "symbol": order.symbol,
                   "market": order.market, "qty": fill.qty, "price_gbp": fill.price_gbp, "fee_gbp": fill.fee_gbp,
                   "value_gbp": fill.qty * fill.price_gbp, "pnl_gbp": pnl, "estimated": fill.estimated,
                   "reason": order.reason}
+        self.cfg.trades_path.parent.mkdir(parents=True, exist_ok=True)
         with self.cfg.trades_path.open("a") as fh:
             fh.write(json.dumps(record) + "\n")
         log.info("%s %s %.6f @ £%.2f (£%.2f)%s | %s", order.side.upper(), order.symbol, fill.qty, fill.price_gbp,
@@ -79,21 +82,37 @@ class Engine:
         if pf.halted and not was_halted:
             log.error("KILL SWITCH: %s. Selling everything.", pf.halt_reason)
 
+        market_ok = regime_ok(self.data.index_closes(), self.cfg) if self.cfg.regime_filter else True
+        if not market_ok:
+            log.info("S&P 500 is below its %d-day average: no new buys this cycle", self.cfg.regime_sma)
+
         advice = None
         if self.advisor and not pf.halted:
-            picks = candidates(pf, snaps, self.cfg, today)
+            picks = candidates(pf, snaps, self.cfg, today) if market_ok else []
+            picks = picks[: 2 * self.cfg.max_positions]  # only the names that could realistically be bought
             if pf.positions or picks:
                 context = self.platform.market_context() if self.platform else None
-                advice = self.advisor.advise(pf, snaps, picks, context)
+                news = {}
+                if self.cfg.ai_news:
+                    for symbol in [*pf.positions, *(s.symbol for s in picks)]:
+                        if snaps.get(symbol) and snaps[symbol].market == "us-stock":
+                            news[symbol] = self.data.headlines(symbol)
+                advice = self.advisor.advise(pf, snaps, picks, context, news)
 
         trades = []
         for order in exit_orders(pf, snaps, self.cfg, today, advice, liquidate=pf.halted):
             trades.append(self._execute(order, snaps[order.symbol], now))
-        for order in entry_orders(pf, snaps, self.cfg, today, advice):
+        for order in entry_orders(pf, snaps, self.cfg, today, advice, regime_ok=market_ok):
             trades.append(self._execute(order, snaps[order.symbol], now))
 
+        prices = {s: v.price for s, v in snaps.items()}
+        self.cfg.equity_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.cfg.equity_path.open("a") as fh:
+            fh.write(json.dumps({"time": now.isoformat(), "equity_gbp": round(pf.equity(prices), 4),
+                                 "cash_gbp": round(pf.cash, 4)}) + "\n")
         pf.save(self.cfg.state_path)
         return {"time": now.isoformat(), "trades": [t for t in trades if t], "ai_used": advice is not None,
+                "market_ok": market_ok,
                 **self.status(prices)}
 
     def status(self, prices: Optional[dict[str, float]] = None) -> dict:

@@ -13,7 +13,8 @@ from trading_bot.data import is_market_open
 from trading_bot.engine import Engine
 from trading_bot.indicators import snapshot
 from trading_bot.models import Fill, Order, Portfolio, Position, Snapshot
-from trading_bot.strategy import circuit_breaker, entry_orders, exit_orders
+from trading_bot.report import summarise
+from trading_bot.strategy import circuit_breaker, entry_orders, exit_orders, regime_ok
 
 TODAY = date(2026, 11, 12)
 OPEN = datetime(2026, 11, 12, 15, 0, tzinfo=timezone.utc)  # Thursday 10:00 New York
@@ -103,13 +104,32 @@ def test_ai_can_veto_and_rank_but_not_add(cfg):
 # ---------- exits ----------
 def test_stop_loss_trailing_stop_trend_and_ai_exits(cfg):
     pf = portfolio(cash=0, SL=held(100), TR=held(100, high=130), TB=held(100), AI=held(100), OK=held(100))
-    snaps = {"SL": snap("SL", 89), "TR": snap("TR", 109), "TB": snap("TB", 100, up=False),
+    snaps = {"SL": snap("SL", 89), "TR": snap("TR", 103), "TB": snap("TB", 100, up=False),
              "AI": snap("AI", 105), "OK": snap("OK", 105)}
     advice = {"AI": {"action": "sell", "confidence": 0.9, "reason": "deteriorating"}}
-    reasons = {o.symbol: o.reason for o in exit_orders(pf, snaps, cfg, TODAY, advice)}
+    orders = exit_orders(pf, snaps, cfg, TODAY, advice)
+    reasons = {o.symbol: o.reason for o in orders}
     assert set(reasons) == {"SL", "TR", "TB", "AI"}
     assert "stop-loss" in reasons["SL"] and "trailing" in reasons["TR"] and "trend" in reasons["TB"]
-    assert "SL" in pf.cooldowns and "TB" not in pf.cooldowns
+    assert {o.symbol for o in orders if o.stop} == {"SL", "TR"}  # only stop-outs trigger a cooldown
+
+
+def test_regime_filter_blocks_new_buys_only(cfg):
+    idx = pd.date_range("2025-01-01", periods=260, freq="B")
+    falling = pd.Series([5000 * 0.999 ** i for i in range(260)], index=idx)
+    assert regime_ok(falling[::-1].set_axis(idx), cfg) and not regime_ok(falling, cfg)
+    assert regime_ok(None, cfg) and regime_ok(falling.head(50), cfg)  # no data: do not block
+    assert regime_ok(falling, Config(regime_filter=False))
+    assert entry_orders(portfolio(), {"A": snap("A")}, cfg, TODAY, regime_ok=False) == []
+    pf = portfolio(cash=0, A=held(100))
+    assert exit_orders(pf, {"A": snap("A", 85)}, cfg, TODAY)  # exits still work in a bad market
+
+
+def test_volatility_sizing_shrinks_wild_shares(cfg):
+    cfg.vol_target = 0.25
+    orders = entry_orders(portfolio(), {"CALM": snap("CALM", vol=0.20), "WILD": snap("WILD", vol=0.50)}, cfg, TODAY)
+    size = {o.symbol: o.gbp_amount for o in orders}
+    assert size["CALM"] == pytest.approx(15.83, abs=0.01) and size["WILD"] == pytest.approx(7.92, abs=0.01)
 
 
 def test_exit_buffer_prevents_whipsaw_and_missing_price_never_sells(cfg):
@@ -153,11 +173,17 @@ def test_portfolio_persists(tmp_path):
 
 # ---------- engine ----------
 class FakeData:
-    def __init__(self, snaps):
-        self.snaps = snaps
+    def __init__(self, snaps, index=None):
+        self.snaps, self.index = snaps, index
 
     def snapshots(self, now=None):
         return self.snaps
+
+    def index_closes(self):
+        return self.index
+
+    def headlines(self, symbol):
+        return [{"date": "2026-11-11", "title": f"{symbol} news", "summary": ""}]
 
 
 def test_engine_cycle_buys_persists_and_publishes(cfg):
@@ -172,6 +198,33 @@ def test_engine_cycle_buys_persists_and_publishes(cfg):
     engine = Engine(cfg, PaperBroker(cfg), FakeData({"A": snap("A", 99, up=False)}))
     report = engine.run_cycle(OPEN + timedelta(days=1))
     assert report["positions"] == {} and report["trades"][0]["side"] == "sell"
+
+
+def test_engine_stop_out_starts_cooldown_and_records_equity(cfg):
+    engine = Engine(cfg, PaperBroker(cfg), FakeData({"A": snap("A", 88)}))
+    engine.portfolio = portfolio(cash=40.0, A=held(100, qty=0.1))
+    report = engine.run_cycle(OPEN)
+    assert report["trades"][0]["side"] == "sell" and "A" in engine.portfolio.cooldowns
+    assert json.loads(cfg.equity_path.read_text().splitlines()[-1])["equity_gbp"] == pytest.approx(report["equity_gbp"], abs=0.01)
+
+
+def test_engine_respects_bad_market_and_feeds_news_to_ai(cfg):
+    idx = pd.date_range("2025-01-01", periods=260, freq="B")
+    bear = pd.Series([5000 * 0.999 ** i for i in range(260)], index=idx)
+    engine = Engine(cfg, PaperBroker(cfg), FakeData({"A": snap("A")}, index=bear))
+    report = engine.run_cycle(OPEN)
+    assert report["trades"] == [] and report["market_ok"] is False
+
+    seen = {}
+
+    def advise(pf, snaps, picks, context, news):
+        seen.update(news=news, picks=[p.symbol for p in picks])
+        return {"A": {"action": "buy", "confidence": 0.9, "reason": "ok"}}
+
+    engine = Engine(cfg, PaperBroker(cfg), FakeData({"A": snap("A")}), advisor=SimpleNamespace(advise=advise))
+    report = engine.run_cycle(OPEN)
+    assert seen["picks"] == ["A"] and seen["news"]["A"][0]["title"] == "A news"
+    assert report["ai_used"] and [t["symbol"] for t in report["trades"]] == ["A"]
 
 
 def test_engine_waits_when_market_closed(cfg):
@@ -204,7 +257,7 @@ class FakeT212:
 
     def __init__(self, cash=100.0, fills=True, currency="GBP"):
         self.cash, self.fills, self.currency = cash, fills, currency
-        self.qty, self.cost, self.calls = 0.0, 0.0, []
+        self.qty, self.cost, self.calls, self.history = 0.0, 0.0, [], []
 
     def request(self, method, url, auth=None, headers=None, timeout=None, params=None, json=None):
         self.calls.append((method, url.split("/api/v0")[1], json))
@@ -214,6 +267,8 @@ class FakeT212:
         elif url.endswith("/equity/positions"):
             body = [{"instrument": {"ticker": params["ticker"]}, "quantity": self.qty,
                      "quantityAvailableForTrading": self.qty, "walletImpact": {"totalCost": self.cost}}] if self.qty else []
+        elif url.endswith("/history/orders"):
+            body = {"items": self.history}
         elif url.endswith("/orders/market"):
             if self.fills:
                 self.qty += json["quantity"]
@@ -234,8 +289,18 @@ def test_t212_buy_then_sell(cfg):
     order = next(c for c in fake.calls if c[1] == "/equity/orders/market")[2]
     assert order == {"ticker": "AAPL_US_EQ", "quantity": 0.149, "extendedHours": False}
     assert fill.qty == 0.149 and fill.price_gbp == pytest.approx(100.2) and fill.qty * fill.price_gbp <= 15.0
+    fake.history = [{"order": {"id": 7}, "fill": {"quantity": -0.149, "walletImpact": {"currency": "GBP", "netValue": 16.3}}}]
     fill = broker.execute(Order("sell", "AAPL", "us-stock", "t", qty=0.149), snap("AAPL", 110))
-    assert fake.calls[-2][2]["quantity"] == -0.149 and fill.estimated and fake.qty == pytest.approx(0)
+    sent = [c[2]["quantity"] for c in fake.calls if c[1] == "/equity/orders/market"]
+    assert sent == [0.149, -0.149] and fake.qty == pytest.approx(0)
+    assert not fill.estimated and fill.qty * fill.price_gbp == pytest.approx(16.3)  # exact proceeds from history
+
+
+def test_t212_sell_estimates_when_history_lags(cfg):
+    fake = FakeT212()
+    fake.qty, fake.cost = 0.2, 20.0
+    fill = t212(cfg, fake).execute(Order("sell", "AAPL", "us-stock", "t", qty=0.2), snap("AAPL", 110))
+    assert fill.estimated and fill.price_gbp == 110
 
 
 def test_t212_guards(cfg, monkeypatch):
@@ -274,8 +339,10 @@ def test_advisor_parses_clamps_and_ignores_unknown_symbols(cfg):
     client, seen = fake_claude({"market_view": "ok", "decisions": [
         {"symbol": "A", "action": "buy", "confidence": 1.7, "reason": "steady"},
         {"symbol": "ZZZ", "action": "buy", "confidence": 0.9, "reason": "not offered"}]})
-    advice = ClaudeAdvisor(cfg, client).advise(portfolio(), {"A": snap("A")}, [snap("A")])
+    news = {"A": [{"date": "2026-11-11", "title": "A beats forecasts", "summary": ""}]}
+    advice = ClaudeAdvisor(cfg, client).advise(portfolio(), {"A": snap("A")}, [snap("A")], headlines=news)
     assert advice == {"A": {"action": "buy", "confidence": 1.0, "reason": "steady"}}
+    assert json.loads(seen["messages"][0]["content"])["candidates"][0]["recent_headlines"] == news["A"]
     assert seen["model"] == "claude-opus-5-5" and "temperature" not in seen
     assert json.loads(seen["messages"][0]["content"])["candidates"][0]["symbol"] == "A"
 
@@ -296,3 +363,16 @@ def test_backtest_profits_in_uptrend_and_stays_out_of_downtrend(cfg):
     assert result["final_gbp"] > 50 and result["trades"] == 1 and result["kill_switch_trips"] == 0
     flat = run_backtest(cfg, {"DOWN": ("us-stock", down)})
     assert flat["final_gbp"] == 50.0 and flat["trades"] == 0
+
+
+# ---------- report ----------
+def test_report_summarises_trades_and_drawdown():
+    trades = [{"side": "buy", "fee_gbp": 0.02}, {"side": "sell", "pnl_gbp": 2.0, "fee_gbp": 0.03, "reason": "trend broken (x)"},
+              {"side": "sell", "pnl_gbp": -1.0, "fee_gbp": 0.02, "reason": "stop-loss (10% below entry)"}]
+    equity = [{"time": "2026-11-01T00:00:00", "equity_gbp": 50}, {"time": "2026-11-05T00:00:00", "equity_gbp": 55},
+              {"time": "2026-11-09T00:00:00", "equity_gbp": 49.5}]
+    r = summarise(trades, equity, 50.0)
+    assert (r["closed_trades"], r["win_rate_pct"], r["realised_pnl_gbp"], r["fees_gbp"]) == (2, 50, 1.0, 0.07)
+    assert r["return_pct"] == -1.0 and r["max_drawdown_pct"] == -10.0
+    assert r["exit_reasons"] == {"trend broken": 1, "stop-loss": 1}
+    assert summarise([], [], 50.0)["trades"] == 0

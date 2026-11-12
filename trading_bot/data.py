@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -58,6 +58,36 @@ class MarketData:
             return usd
         fx = self.gbpusd().reindex(usd.index.union(self.gbpusd().index)).ffill().reindex(usd.index)
         return (usd / fx).dropna()
+
+    def index_closes(self) -> Optional[pd.Series]:
+        """S&P 500 daily closes for the market-regime filter (None if unavailable)."""
+        try:
+            closes = _daily_closes("^GSPC", self.period)
+            return None if closes.empty else closes
+        except Exception as exc:
+            log.warning("S&P 500 data unavailable (%s); regime filter skipped this cycle", exc)
+            return None
+
+    def headlines(self, symbol: str, limit: int = 3, max_age_days: int = 7) -> list[dict]:
+        """Recent Yahoo Finance headlines for one share. Best effort: returns [] on any problem."""
+        try:
+            import yfinance as yf
+
+            cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+            out = []
+            for item in yf.Ticker(symbol).news or []:
+                content = item.get("content") or {}
+                title, published = content.get("title"), content.get("pubDate")
+                if not title or not published:
+                    continue
+                if datetime.fromisoformat(published.replace("Z", "+00:00")) < cutoff:
+                    continue
+                out.append({"date": published[:10], "title": str(title)[:200],
+                            "summary": str(content.get("summary") or "")[:300]})
+            return sorted(out, key=lambda h: h["date"], reverse=True)[:limit]
+        except Exception as exc:
+            log.debug("No headlines for %s: %s", symbol, exc)
+            return []
 
     def snapshots(self, today: Optional[datetime] = None) -> dict[str, Snapshot]:
         today = today or datetime.now(timezone.utc)

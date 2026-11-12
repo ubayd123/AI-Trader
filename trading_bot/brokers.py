@@ -106,15 +106,29 @@ class Trading212Broker:
         scale = 10 ** self.cfg.t212_quantity_decimals
         return math.floor(qty * scale + 1e-9) / scale
 
-    def _place_and_wait(self, ticker: str, signed_qty: float, before_qty: float) -> tuple[float, float]:
-        """Place a market order; return (new quantity, new total cost). Cancels if it does not fill."""
+    def _sale_proceeds(self, ticker: str, order_id, qty: float) -> Optional[float]:
+        """Net GBP received for a filled sell order, from the order history. None if not there yet."""
+        try:
+            history = self._request("GET", "/equity/history/orders", params={"ticker": ticker, "limit": 5}) or {}
+            for item in history.get("items", []):
+                order, fill = item.get("order") or {}, item.get("fill") or {}
+                impact = fill.get("walletImpact") or {}
+                if order.get("id") == order_id and impact.get("currency", "GBP") == "GBP" \
+                        and abs(abs(float(fill.get("quantity") or 0)) - qty) < 1e-6 and impact.get("netValue"):
+                    return abs(float(impact["netValue"]))
+        except (BrokerError, TypeError, ValueError) as exc:
+            log.debug("Order history unavailable for %s: %s", ticker, exc)
+        return None
+
+    def _place_and_wait(self, ticker: str, signed_qty: float, before_qty: float) -> tuple[float, float, object]:
+        """Place a market order; return (new quantity, new total cost, order id). Cancels if it does not fill."""
         placed = self._request("POST", "/equity/orders/market",
                                json={"ticker": ticker, "quantity": signed_qty, "extendedHours": False})
         for _ in range(self.FILL_POLLS):
             self.sleep(self.POLL_SECONDS)
             qty, _, cost = self._position(ticker)
             if abs((qty - before_qty) - signed_qty) < 10 ** -(self.cfg.t212_quantity_decimals + 1):
-                return qty, cost
+                return qty, cost, (placed or {}).get("id")
         order_id = (placed or {}).get("id")
         try:
             self._request("DELETE", f"/equity/orders/{order_id}")
@@ -136,7 +150,7 @@ class Trading212Broker:
             qty = self._floor(order.gbp_amount / (snap.price * (1.005 + self.cfg.stock_fee_pct)))
             if qty <= 0:
                 raise BrokerError(f"£{order.gbp_amount:.2f} is too small to buy {order.symbol} at this precision")
-            new_qty, new_cost = self._place_and_wait(ticker, qty, before_qty)
+            _, new_cost, _ = self._place_and_wait(ticker, qty, before_qty)
             cost = new_cost - before_cost
             if cost <= 0:  # cost basis unavailable: fall back to an estimate
                 return Fill(qty, snap.price, qty * snap.price * self.cfg.stock_fee_pct, estimated=True)
@@ -146,8 +160,11 @@ class Trading212Broker:
         qty = self._floor(min(order.qty, sellable))
         if qty <= 0:
             raise PositionMissing(f"Trading 212 holding of {order.symbol} is too small to sell")
-        self._place_and_wait(ticker, -qty, before_qty)
-        # The API does not return the fill value synchronously; proceeds are estimated from the latest price.
+        _, _, order_id = self._place_and_wait(ticker, -qty, before_qty)
+        proceeds = self._sale_proceeds(ticker, order_id, qty)
+        if proceeds:
+            return Fill(qty=qty, price_gbp=proceeds / qty, fee_gbp=0.0)  # costs are inside the net value
+        # History can lag the fill: fall back to an estimate from the latest price.
         return Fill(qty=qty, price_gbp=snap.price, fee_gbp=qty * snap.price * self.cfg.stock_fee_pct, estimated=True)
 
 

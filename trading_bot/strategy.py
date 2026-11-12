@@ -60,7 +60,7 @@ def exit_orders(portfolio: Portfolio, snaps: dict[str, Snapshot], cfg: Config, t
         if snap is None:
             continue  # no fresh price: never trade blind
         reason = None
-        stopped = False
+        stopped = False  # stop-outs start a re-entry cooldown once the sale executes
         if liquidate:
             reason = "kill switch: max drawdown breached"
         elif snap.price <= pos.avg_price * (1 - cfg.stop_loss_pct):
@@ -74,10 +74,20 @@ def exit_orders(portfolio: Portfolio, snaps: dict[str, Snapshot], cfg: Config, t
             if ai:
                 reason = f"AI exit: {ai}"
         if reason:
-            if stopped:
-                portfolio.cooldowns[symbol] = (today + timedelta(days=cfg.cooldown_days)).isoformat()
-            orders.append(Order("sell", symbol, pos.market, reason, qty=pos.qty))
+            orders.append(Order("sell", symbol, pos.market, reason, qty=pos.qty, stop=stopped))
     return orders
+
+
+def start_cooldown(portfolio: Portfolio, order: Order, cfg: Config, today: date) -> None:
+    if order.stop:
+        portfolio.cooldowns[order.symbol] = (today + timedelta(days=cfg.cooldown_days)).isoformat()
+
+
+def regime_ok(index_closes, cfg: Config) -> bool:
+    """True when the broad market (S&P 500) is above its long average, or the filter is off / has no data."""
+    if not cfg.regime_filter or index_closes is None or len(index_closes) < cfg.regime_sma:
+        return True
+    return float(index_closes.iloc[-1]) > float(index_closes.tail(cfg.regime_sma).mean())
 
 
 def candidates(portfolio: Portfolio, snaps: dict[str, Snapshot], cfg: Config, today: date) -> list[Snapshot]:
@@ -94,8 +104,8 @@ def candidates(portfolio: Portfolio, snaps: dict[str, Snapshot], cfg: Config, to
 
 
 def entry_orders(portfolio: Portfolio, snaps: dict[str, Snapshot], cfg: Config, today: date,
-                 advice: Optional[Advice] = None) -> list[Order]:
-    if portfolio.halted:
+                 advice: Optional[Advice] = None, regime_ok: bool = True) -> list[Order]:
+    if portfolio.halted or not regime_ok:
         return []
     picks = candidates(portfolio, snaps, cfg, today)
     if advice is not None:
@@ -114,7 +124,8 @@ def entry_orders(portfolio: Portfolio, snaps: dict[str, Snapshot], cfg: Config, 
     for snap in picks:
         if free_slots <= 0:
             break
-        amount = min(slot, spendable)
+        scale = min(1.0, cfg.vol_target / max(snap.vol, 0.01)) if cfg.vol_target > 0 else 1.0
+        amount = min(slot * scale, spendable)
         if amount < cfg.min_trade_gbp:
             break
         why = _confident(advice, snap.symbol, "buy", cfg) if advice is not None else None

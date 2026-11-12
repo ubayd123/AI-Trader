@@ -56,13 +56,16 @@ class Config:
     sma_slow: int = 50
     rsi_max_entry: float = 75.0  # do not chase overbought names
     exit_buffer_pct: float = 0.03  # exit when price is 3% below the slow average
+    regime_filter: bool = True  # no new buys while the S&P 500 is below its 200-day average
+    regime_sma: int = 200
+    vol_target: float = 0.0  # >0: shrink positions in shares more volatile than this (annualised)
 
     # --- risk limits (enforced in code; the AI cannot override them) ---
     max_positions: int = 3
     cash_reserve_pct: float = 0.05  # always keep 5% in cash
     min_trade_gbp: float = 2.0  # below this, fees/rounding make a trade pointless
     stop_loss_pct: float = 0.10  # sell if 10% below average entry
-    trailing_stop_pct: float = 0.15  # sell if 15% below the high since entry
+    trailing_stop_pct: float = 0.20  # sell if 20% below the high since entry
     max_drawdown_pct: float = 0.25  # kill switch: sell everything and pause trading
     halt_days: int = 30  # length of that pause; 0 = stay stopped until `reset-halt`
     cooldown_days: int = 5  # no re-entry for N days after a stop-out
@@ -83,6 +86,7 @@ class Config:
     ai_enabled: bool = True
     ai_model: str = "claude-opus-5-5"
     ai_min_confidence: float = 0.55
+    ai_news: bool = True  # show Claude recent headlines for candidates and holdings
 
     # --- AI-Trader platform sync (optional) ---
     platform_url: str = "https://ai4trade.ai/api"
@@ -113,6 +117,10 @@ class Config:
     @property
     def trades_path(self) -> Path:
         return Path(self.state_dir) / f"trades_{self.broker}.jsonl"
+
+    @property
+    def equity_path(self) -> Path:
+        return Path(self.state_dir) / f"equity_{self.broker}.jsonl"
 
     @classmethod
     def from_env(cls) -> "Config":

@@ -81,9 +81,19 @@ def cmd_backtest(cfg, args):
         closes = data.closes_gbp(market, symbol)
         if not closes.empty:
             series[symbol] = (market, closes)
-    result = run_backtest(cfg, series)
+    result = run_backtest(cfg, series, data.index_closes() if cfg.regime_filter else None)
     print(json.dumps(result, indent=2))
     print("\nPast performance does not predict future returns. This backtest ignores the AI advisor.")
+
+
+def cmd_report(cfg, args):
+    from .report import build_report
+
+    report = build_report(cfg)
+    if not report.get("cycles"):
+        print("No history yet. Run `python -m trading_bot run` first.")
+        return
+    print(json.dumps(report, indent=2))
 
 
 def cmd_reset_halt(cfg, args):
@@ -122,6 +132,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("backtest", help="backtest the rules on history")
     p.add_argument("--period", default="3y", help="history to test, e.g. 1y, 3y, 5y")
     p.set_defaults(fn=cmd_backtest)
+    sub.add_parser("report", help="performance so far: return, drawdown, win rate, fees").set_defaults(fn=cmd_report)
     sub.add_parser("reset-halt", help="clear the drawdown kill switch").set_defaults(fn=cmd_reset_halt)
     p = sub.add_parser("register", help="register the bot on the AI-Trader platform")
     p.add_argument("name")

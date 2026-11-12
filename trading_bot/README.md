@@ -11,9 +11,10 @@ while risking very little. Read [What to expect](#what-to-expect) before using r
 ```bash
 pip install -r trading_bot/requirements.txt
 
-python -m trading_bot backtest          # how the rules did on the last 3 years
+python -m trading_bot backtest          # how the rules did on the last 3 years (--period 10y for longer)
 python -m trading_bot run               # one trading cycle (paper money)
 python -m trading_bot status            # your portfolio
+python -m trading_bot report            # performance so far: return, drawdown, win rate, fees
 python -m trading_bot loop --interval 3600   # keep running, one cycle an hour
 ```
 
@@ -30,13 +31,14 @@ sectors, priced in GBP) and applies these rules:
 
 | Step | Rule |
 |---|---|
+| Market check | No new buys while the S&P 500 is below its 200-day average. Existing positions are still managed. |
 | Buy | Price and 20-day average both above the 50-day average, positive momentum, RSI under 75. Best risk-adjusted momentum first. |
 | Size | Up to 3 positions of about £16 each. 5% always stays in cash. Nothing under £2. |
-| Sell | 10% below entry (stop-loss), 15% below the high since entry (trailing stop), or 3% below the 50-day average (trend broken). |
+| Sell | 10% below entry (stop-loss), 20% below the high since entry (trailing stop), or 3% below the 50-day average (trend broken). |
 | Kill switch | If the account falls 25% from its peak, sell everything and pause for 30 days. |
 
 **The AI part.** If `ANTHROPIC_API_KEY` is set, Claude reviews each cycle's candidates and open
-positions. It can veto a buy, rank the candidates, and ask to exit a position. It cannot pick
+positions, together with the last week's news headlines for each one. It can veto a buy, rank the candidates, and ask to exit a position. It cannot pick
 shares outside the candidates, change position sizes, or override any limit above: those are
 enforced in code (`strategy.py`). If the AI call fails, the bot carries on with the rules alone.
 Without a key the bot is rules-only.
@@ -56,8 +58,8 @@ account in GBP. Crypto is not available through this route.
 
 The Trading 212 adapter is tested against a simulated API built from their published
 specification, not against a real account. Use demo mode first and check the first few orders
-in the app. Sale proceeds are estimated from the latest price, so the bot's ledger can drift a
-few pence from the broker's figures.
+in the app. Sale proceeds are read back from the order history; if that is slow to update the
+bot estimates them from the latest price (the trade log marks these `"estimated": true`).
 
 ## Publishing to AI-Trader (optional)
 
@@ -72,18 +74,22 @@ context for Claude when that data is fresh.
 
 ## What to expect
 
-Backtest of the rules (no AI) with default settings, February 2021 to November 2026, fees included:
+Backtest of the rules (no AI) with default settings, February 2017 to November 2026, fees included:
 
 | | Bot | Buying and holding the same 12 shares |
 |---|---|---|
-| £50 became | £141 | £175 |
-| Worst fall from a peak | -22% | not measured |
-| Trades | 131 (45% of closed trades profitable) | 12 |
+| £50 became | £265 | £514 |
+| Worst fall from a peak | -21% | -30% |
+| Trades | 199 (46% of closed trades profitable) | 12 |
 
-- **It underperformed simply holding the shares.** Trend following gives up return in rising
-  markets in exchange for smaller falls. The watchlist was also chosen with hindsight (these are
-  today's winners), so both columns flatter the future.
-- **Fees matter at this size.** The backtest paid about £5 in costs, 10% of the starting balance.
+- **It made about half of what simply holding the shares made**, with smaller falls along the way.
+  Trend following gives up return in rising markets in exchange for shallower drops. The watchlist
+  was also chosen with hindsight (these are today's winners), so both columns flatter the future.
+- **The settings were checked on two separate five-year halves** (2017-2021 and 2022-2026). The
+  market check and the 20% trailing stop were kept because they lowered the worst fall and the
+  number of trades in both halves without reducing the return. Wider position counts, volatility
+  sizing and looser exits were tried and dropped because they did not hold up in both.
+- **Fees matter at this size.** The backtest paid about £11 in costs, over a fifth of the starting balance.
 - **You can lose money.** The limits cap the damage but do not prevent losses. Only use money
   you can afford to lose.
 - **Tax.** Gains outside an ISA count towards Capital Gains Tax; a Stocks ISA avoids that.
@@ -101,4 +107,5 @@ This is software for learning, not financial advice.
 | `data.py` | Prices via Yahoo Finance, converted to GBP |
 | `platform_client.py` | AI-Trader signal publishing and market context |
 | `backtest.py` | Historical simulation |
+| `report.py` | Performance summary from the trade log and equity history |
 | `tests/` | `python -m pytest trading_bot/tests` |
