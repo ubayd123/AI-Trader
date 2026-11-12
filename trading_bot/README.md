@@ -6,6 +6,9 @@ prices converted to GBP, and can later be pointed at a Trading 212 account.
 It will not make you rich. On £50 the realistic goal is to learn how automated trading behaves
 while risking very little. Read [What to expect](#what-to-expect) before using real money.
 
+There are two bots here. This page covers the slower one, which holds shares for days or weeks. The
+rapid intraday bot (IG spread betting or eToro) is described in [day/README.md](day/README.md).
+
 ## Quick start
 
 ```bash

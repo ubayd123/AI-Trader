@@ -348,6 +348,31 @@ class DayEngine:
             self._record(now, "buy", pos, fill.price, None, signal.reason)
             self._save()
 
+    def precheck(self, quotes: dict[str, Quote]) -> dict[str, str]:
+        """Which markets cannot be traded at all with this budget, and why. Run once when a session starts,
+        so a too-small account is told straight away instead of silently never trading."""
+        cfg, equity, cur = self.cfg, self.equity(), self.cfg.currency
+        for symbol, quote in quotes.items():
+            if symbol not in self.series or quote.ask <= 0:
+                continue
+            spec = self.spec(symbol)
+            floor = max(spec.min_notional, spec.min_size * quote.ask)
+            if spec.margin_pct >= 1.0:
+                if equity * (1 - cfg.cash_reserve_pct) < floor:
+                    self._block(symbol, f"the budget is below the minimum trade of {cur}{floor:.2f}")
+                continue
+            stop_pct = max(cfg.min_stop_pct, 1.05 * spec.min_stop_distance / quote.ask)
+            loss = floor * (stop_pct + quote.spread_pct)
+            risk_cash = equity * cfg.risk_per_trade_pct
+            if loss > risk_cash:
+                self._block(symbol, (
+                    f"the smallest trade the broker allows ({cur}{floor:,.0f} exposure) would lose about "
+                    f"{cur}{loss:.2f} if stopped out; the limit per trade is {cur}{risk_cash:.2f} "
+                    f"({cfg.risk_per_trade_pct:.2%} of {cur}{equity:.2f})"))
+            elif floor * spec.margin_pct > equity * (1 - cfg.cash_reserve_pct):
+                self._block(symbol, f"the smallest trade needs {cur}{floor * spec.margin_pct:,.2f} of margin, more than the budget")
+        return dict(self.blocked)
+
     def slots(self) -> int:
         """How many unleveraged positions of the broker's minimum size the budget can hold."""
         usable = self.equity() * (1 - self.cfg.cash_reserve_pct)

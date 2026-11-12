@@ -19,6 +19,7 @@ LONDON = ZoneInfo("Europe/London")
 def run(cfg: DayConfig, engine: DayEngine, feed, screen: Optional[Callable[[], list]] = None, sleep=time.sleep,
         clock=lambda: datetime.now(timezone.utc), max_loops: Optional[int] = None) -> None:
     prepared = None  # the session we have warmed up for
+    checked = None  # the session we have run the budget pre-check for
     told_closed = False
     last_status = None
     loops = 0
@@ -54,6 +55,12 @@ def run(cfg: DayConfig, engine: DayEngine, feed, screen: Optional[Callable[[], l
                 log.warning("No quotes this round: %s", exc)
                 sleep(cfg.poll_seconds)
                 continue
+            if checked != session and quotes:
+                checked = session
+                blocked = engine.precheck(quotes)
+                if blocked and len(blocked) >= len(quotes):
+                    log.warning("NOTHING CAN BE TRADED with a budget of %s%.2f inside your limits. The bot will keep "
+                                "watching but place no trades. See `day check` and the README.", cfg.currency, engine.equity())
             engine.on_quotes(now, quotes)
             stamp = now.replace(minute=now.minute - now.minute % 5, second=0, microsecond=0)
             if stamp != last_status:

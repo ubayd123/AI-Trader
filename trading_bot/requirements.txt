@@ -2,4 +2,5 @@ yfinance>=0.2.30
 pandas>=2.0
 requests>=2.31.0
 anthropic>=1.0  # optional: only needed for the Claude advisor
+trading-ig>=0.0.25  # only needed for the IG intraday bot
 pytest>=8.0.0

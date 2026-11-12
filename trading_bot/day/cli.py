@@ -137,10 +137,10 @@ def cmd_backtest(args) -> None:
         raise BrokerError("No usable price history was downloaded.")
     budget = float(args.budget) if args.budget else (cfg.budget_gbp if cfg.broker == "ig" else cfg.budget_usd or cfg.budget_gbp * 1.32)
     result = replay(cfg, data, round(budget, 2))
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2, ensure_ascii=False))
     cur = result["currency"]
     print(f"\nPreset '{cfg.preset}' on {', '.join(data)}: {cur}{result['start']:,.2f} became {cur}{result['final']:,.2f} over "
-          f"{result['days']} trading days ({result['total_return_pct']:+.1f}%), {result['trades_per_day']:.0f} trades a day, "
+          f"{result['days']} trading days ({result['total_return_pct']:+.1f}%), about {result['trades_per_day']:.0f} trades a day, "
           f"best day {result['best_day_pct']:+.2f}%, worst day {result['worst_day_pct']:+.2f}%.")
     for symbol, why in result["not_traded"].items():
         print(f"Not traded, {symbol}: {why}")
@@ -320,7 +320,7 @@ def cmd_report(args) -> None:
         return
     trades = [json.loads(line) for line in cfg.trades_path.read_text().splitlines() if line.strip()]
     state = DayState.load(cfg.state_path)
-    print(json.dumps(day_report(trades, state.budget if state else 0.0), indent=2))
+    print(json.dumps(day_report(trades, state.budget if state else 0.0), indent=2, ensure_ascii=False))
 
 
 def cmd_markets(args) -> None:

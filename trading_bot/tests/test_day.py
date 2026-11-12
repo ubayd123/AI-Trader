@@ -658,3 +658,352 @@ def test_day_report_groups_by_day():
     assert (report["days"], report["round_trips"], report["win_rate_pct"], report["winning_days"]) == (2, 2, 50, 1)
     assert report["realised_pnl"] == -0.06 and report["return_pct"] == -0.09
     assert report["by_day"]["2026-11-13"] == {"trades": 2, "pnl": -0.11}
+
+
+# =====================================================================
+# Leverage: sizing by risk, margin and the broker's minimum size
+# =====================================================================
+class LeveragedBroker(FakeBroker):
+    def __init__(self, **spec):
+        super().__init__()
+        self._spec = Spec(**{"min_size": 0.5, "size_decimals": 2, "margin_pct": 0.05, **spec})
+
+    def spec(self, symbol):
+        return self._spec
+
+
+def test_leveraged_trade_is_sized_by_risk_and_ties_up_only_margin(cfg):
+    engine = make_engine(cfg, LeveragedBroker(), budget=10_000.0)
+    warm_up(engine)
+    dip(engine)
+    (symbol, amount, stop, target), = engine.broker.opened
+    pos, = engine.state.positions
+    loss_at_stop = (pos.entry - pos.stop) * pos.units
+    assert 20 < loss_at_stop <= 25.5  # 0.25% of £10,000, never more
+    assert pos.units == round(pos.units, 2) and pos.units >= 0.5
+    assert pos.margin == pytest.approx(pos.amount * 0.05, rel=1e-6)
+    assert engine.cash() == pytest.approx(10_000 - pos.margin)  # exposure of thousands, margin of a few hundred
+
+
+def test_minimum_bet_too_big_for_a_small_account_is_refused_not_oversized(cfg):
+    engine = make_engine(cfg, LeveragedBroker(), budget=50.0)
+    warm_up(engine)
+    dip(engine)
+    assert engine.broker.opened == [] and engine.state.positions == []
+    why = engine.blocked["AAA"]
+    assert "smallest trade" in why and "limit per trade" in why
+    assert engine.status()["blocked"] == {"AAA": why}
+
+
+def test_leverage_respects_free_margin_min_stop_distance_and_closed_markets(cfg):
+    cfg.risk_per_trade_pct = 0.02  # a big risk budget, so margin becomes the binding limit
+    engine = make_engine(cfg, LeveragedBroker(margin_pct=0.2, min_size=0.01), budget=100.0)
+    warm_up(engine)
+    dip(engine)
+    pos, = engine.state.positions
+    assert pos.margin <= 100 * (1 - cfg.cash_reserve_pct) + 1e-6 and engine.cash() >= 100 * cfg.cash_reserve_pct - 1e-6
+
+    engine = make_engine(cfg, LeveragedBroker(min_stop_distance=1.0), budget=10_000.0)  # stops must be 1 point away
+    warm_up(engine)
+    dip(engine)
+    _, _, stop, target = engine.broker.opened[0]
+    ask = engine.state.positions[0].entry
+    assert ask - stop >= 1.0 and target - ask >= 1.0
+
+    engine = make_engine(cfg, LeveragedBroker(tradable=False), budget=10_000.0)
+    warm_up(engine)
+    dip(engine)
+    assert engine.broker.opened == [] and "not open" in engine.blocked["AAA"]
+
+
+def test_ig_backtest_small_budget_cannot_trade_and_large_budget_can(cfg):
+    cfg.broker, cfg.symbols, cfg.z_entry = "ig", ["US500"], 2.0
+    idx = pd.date_range(OPEN, periods=390, freq="1min")
+    base = [7600 + 1.0 * (-1) ** i for i in range(390)]
+    for i in (100, 101, 200, 201):
+        base[i] = 7585.0
+    frame = pd.DataFrame({"open": base, "high": [p + 3 for p in base], "low": [p - 1 for p in base], "close": base}, index=idx)
+    small = replay(cfg, {"US500": frame}, budget=50.0)
+    assert small["trades"] == 0 and small["final"] == 50.0 and "smallest trade" in small["not_traded"]["US500"]
+    big = replay(cfg, {"US500": frame}, budget=10_000.0)
+    assert big["round_trips"] == 2 and big["final"] > 10_000 and big["currency"] == "£" and big["not_traded"] == {}
+    assert SimBroker(cfg).spec("US500") == Spec(min_size=0.5, size_decimals=2, margin_pct=0.05)
+
+
+# =====================================================================
+# IG, emulated from IG's API reference and the trading-ig library
+# =====================================================================
+from trading_bot.day.ig import IGBroker, IGClient, IGError, IGFeed, resolve_epics  # noqa: E402
+
+US500 = "IX.D.SPTRD.DAILY.IP"
+
+
+class FakeIG:
+    """In-memory IG. Method names, arguments and reply shapes follow trading_ig.IGService."""
+
+    def __init__(self, accounts=None, default="SB1"):
+        self.accounts = accounts or [{"accountId": "SB1", "accountType": "SPREADBET"}, {"accountId": "CF1", "accountType": "CFD"}]
+        self.current, self.logins, self.n = default, 0, 0
+        self.calls, self.positions, self.activities, self.fail = [], {}, [], []
+        self.reject = None
+        self.markets = {US500: {
+            "instrument": {"epic": US500, "name": "US 500", "expiry": "DFB", "marginFactor": 5, "marginFactorUnit": "PERCENTAGE",
+                           "currencies": [{"code": "USD", "isDefault": False}, {"code": "GBP", "isDefault": True}]},
+            "dealingRules": {"minDealSize": {"unit": "POINTS", "value": 0.5},
+                             "minNormalStopOrLimitDistance": {"unit": "POINTS", "value": 4.0}},
+            "snapshot": {"bid": 7599.8, "offer": 7600.2, "marketStatus": "TRADEABLE", "delayTime": 0, "decimalPlacesFactor": 1}}}
+
+    def price(self, mid, epic=US500):
+        self.markets[epic]["snapshot"].update(bid=round(mid - 0.2, 1), offer=round(mid + 0.2, 1))
+
+    def _fail(self):
+        if self.fail:
+            raise self.fail.pop(0)
+
+    def create_session(self, *a, **k):
+        self.logins += 1
+        kind = next(acc["accountType"] for acc in self.accounts if acc["accountId"] == self.current)
+        return {"currentAccountId": self.current, "accountType": kind, "accounts": self.accounts, "currencyIsoCode": "GBP",
+                "accountInfo": {"balance": 10000.0, "available": 10000.0}}
+
+    def switch_account(self, account_id, default):
+        self.current = account_id
+
+    def fetch_accounts(self):
+        return {"accounts": [{**acc, "balance": {"balance": 10000.0, "available": 9000.0}} for acc in self.accounts]}
+
+    def fetch_market_by_epic(self, epic):
+        self._fail()
+        return self.markets[epic]
+
+    def fetch_markets_by_epics(self, epics, detailed=True):
+        self._fail()
+        self.calls.append(("snapshots", epics, detailed))
+        return [{"instrument": {"epic": e}, "snapshot": self.markets[e]["snapshot"]} for e in epics.split(",")]
+
+    def fetch_historical_prices_by_epic(self, epic, numpoints=None, pagesize=None):
+        def px(v):
+            return {"bid": v - 0.2, "ask": v + 0.2}
+
+        return {"prices": [{"snapshotTimeUTC": f"2026-11-12T14:{31 + i}:00", "openPrice": px(7600), "highPrice": px(7603),
+                            "lowPrice": px(7599), "closePrice": px(7601 + i)} for i in range(2)]}
+
+    def fetch_open_positions(self):
+        return {"positions": [{"position": {"dealId": d, **p}, "market": {"epic": p["epic"]}} for d, p in self.positions.items()]}
+
+    def fetch_account_activity(self, from_date=None, detailed=False):
+        return {"activities": self.activities}
+
+    def create_open_position(self, **kw):
+        self.calls.append(("open", kw))
+        if self.reject:
+            return {"dealStatus": "REJECTED", "reason": self.reject}
+        self.n += 1
+        deal, level = f"DIAAAA{self.n}", self.markets[kw["epic"]]["snapshot"]["offer"]
+        self.positions[deal] = {"epic": kw["epic"], "level": level, "size": kw["size"]}
+        return {"dealStatus": "ACCEPTED", "reason": "SUCCESS", "dealId": deal, "dealReference": f"REF{self.n}", "level": level,
+                "size": kw["size"], "stopLevel": kw["stop_level"], "limitLevel": kw["limit_level"],
+                "affectedDeals": [{"dealId": deal, "status": "OPENED"}]}
+
+    def close_open_position(self, **kw):
+        self.calls.append(("close", kw))
+        if kw["deal_id"] not in self.positions:
+            return {"dealStatus": "REJECTED", "reason": "POSITION_NOT_FOUND"}
+        pos = self.positions.pop(kw["deal_id"])
+        level = self.markets[pos["epic"]]["snapshot"]["bid"]
+        return {"dealStatus": "ACCEPTED", "reason": "SUCCESS", "dealId": kw["deal_id"], "level": level, "size": kw["size"],
+                "profit": round((level - pos["level"]) * kw["size"], 2), "profitCurrency": "GBP"}
+
+
+def ig(cfg, fake=None):
+    cfg.broker, cfg.symbols = "ig", ["US500"]
+    fake = fake or FakeIG()
+    tick = iter(range(0, 10**7, 100))
+    client = IGClient.login("user", "pass", "key", service=fake, sleep=lambda s: None, clock=lambda: next(tick))
+    epics = resolve_epics(cfg.symbols)
+    return fake, client, IGFeed(client, epics), IGBroker(cfg, client, epics, clock=lambda: next(tick))
+
+
+def test_ig_login_picks_the_spread_betting_account_and_explains_failures(cfg):
+    fake, client, _, _ = ig(cfg, FakeIG(default="CF1"))
+    assert (client.account_id, client.account_type, fake.current) == ("SB1", "SPREADBET", "SB1")  # switched from the CFD default
+    assert client.balance() == {"balance": 10000.0, "available": 9000.0}
+    with pytest.raises(IGError, match="spread betting accounts"):
+        IGClient.login("u", "p", "k", service=FakeIG(accounts=[{"accountId": "CF1", "accountType": "CFD"}], default="CF1"))
+    with pytest.raises(IGError, match="not set"):
+        IGClient.login("", "", "")
+
+    class BadLogin(FakeIG):
+        def create_session(self, *a, **k):
+            raise Exception("error.security.invalid-details")
+
+    with pytest.raises(IGError, match="username or password"):
+        IGClient.login("u", "p", "k", service=BadLogin())
+    assert resolve_epics(["US500", "IX.D.FTSE.DAILY.IP"]) == {"US500": US500, "IX.D.FTSE.DAILY.IP": "IX.D.FTSE.DAILY.IP"}
+    with pytest.raises(IGError, match="not a known IG market"):
+        resolve_epics(["APPLE"])
+
+
+def test_ig_feed_quotes_only_live_tradeable_prices(cfg):
+    fake, _, feed, _ = ig(cfg)
+    q = feed.quotes(OPEN)["US500"]
+    assert (q.bid, q.ask, q.time) == (7599.8, 7600.2, OPEN) and fake.calls[-1] == ("snapshots", US500, False)
+    fake.markets[US500]["snapshot"]["marketStatus"] = "EDITS_ONLY"
+    assert feed.quotes(OPEN) == {}
+    fake.markets[US500]["snapshot"].update(marketStatus="TRADEABLE", delayTime=15)
+    assert feed.quotes(OPEN) == {}
+    bars = feed.history("US500")
+    assert [(b.time.minute, b.open, b.high, b.low, b.close) for b in bars] == [(31, 7600, 7603, 7599, 7601), (32, 7600, 7603, 7599, 7602)]
+
+
+def test_ig_broker_reads_market_rules(cfg):
+    fake, _, _, broker = ig(cfg)
+    assert broker.spec("US500") == Spec(min_size=0.5, size_decimals=2, margin_pct=0.05, min_stop_distance=4.0, tradable=True)
+    fake.markets[US500]["dealingRules"]["minNormalStopOrLimitDistance"] = {"unit": "PERCENTAGE", "value": 0.1}
+    fake.markets[US500]["snapshot"]["marketStatus"] = "CLOSED"
+    broker.details("US500", refresh=True)
+    spec = broker.spec("US500")
+    assert spec.min_stop_distance == pytest.approx(7.6002) and not spec.tradable
+
+
+def test_ig_broker_opens_and_closes_a_spread_bet(cfg):
+    fake, _, _, broker = ig(cfg)
+    fill = broker.open("US500", 7676.2, 7575.83, 7624.51, Quote("US500", 7599.8, 7600.2, OPEN))
+    kind, sent = fake.calls[-1]
+    assert kind == "open" and sent == {
+        "currency_code": "GBP", "direction": "BUY", "epic": US500, "expiry": "DFB", "force_open": True,
+        "guaranteed_stop": False, "level": None, "limit_distance": None, "limit_level": 7624.5, "order_type": "MARKET",
+        "quote_id": None, "size": 1.01, "stop_distance": None, "stop_level": 7575.8, "trailing_stop": False,
+        "trailing_stop_increment": None}
+    assert (fill.position_id, fill.units, fill.price, fill.stop, fill.target) == ("DIAAAA1", 1.01, 7600.2, 7575.8, 7624.5)
+    pos = DayPosition("US500", fill.position_id, fill.units, fill.price, fill.units * fill.price, fill.stop, fill.target,
+                      OPEN.isoformat(), "test")
+    fake.price(7610.0)
+    closed = broker.close(pos, Quote("US500", 7609.8, 7610.2, OPEN), "time limit")
+    assert closed.price == 7609.8 and closed.pnl == pytest.approx(9.7, abs=0.01)  # (7609.8 - 7600.2) x £1.01 a point
+    assert fake.calls[-1][1] == {"deal_id": "DIAAAA1", "direction": "SELL", "epic": None, "expiry": None, "level": None,
+                                 "order_type": "MARKET", "quote_id": None, "size": 1.01}
+    assert fake.positions == {}
+
+
+def test_ig_rejections_are_explained(cfg):
+    fake, _, _, broker = ig(cfg)
+    fake.reject = "INSUFFICIENT_FUNDS"
+    with pytest.raises(BrokerError, match="not enough money"):
+        broker.open("US500", 7600.0, 7575.8, 7624.5, Quote("US500", 7599.8, 7600.2, OPEN))
+    fake.reject = "SOME_NEW_REASON"
+    with pytest.raises(BrokerError, match="some new reason"):
+        broker.open("US500", 7600.0, 7575.8, 7624.5, Quote("US500", 7599.8, 7600.2, OPEN))
+
+
+def test_ig_session_expiry_and_rate_limits_are_retried(cfg):
+    fake, client, feed, _ = ig(cfg)
+    fake.fail = [Exception("error.security.client-token-invalid")]
+    assert feed.quotes(OPEN) and fake.logins == 2  # logged in again, then repeated the request
+    fake.fail = [Exception("error.public-api.exceeded-account-allowance")]
+    assert feed.quotes(OPEN)  # waited, then repeated
+    fake.fail = [Exception("boom"), Exception("boom")]
+    with pytest.raises(IGError, match="boom"):
+        feed.quotes(OPEN)
+
+
+def test_ig_sync_books_positions_closed_by_igs_own_stop_or_limit(cfg):
+    fake, _, _, broker = ig(cfg)
+    quote = Quote("US500", 7599.8, 7600.2, OPEN)
+    fill = broker.open("US500", 7676.2, 7575.8, 7624.5, quote)
+    pos = DayPosition("US500", fill.position_id, fill.units, fill.price, 7676.2, 7575.8, 7624.5, OPEN.isoformat(), "test")
+    assert broker.sync([pos], {"US500": quote}, OPEN) == []  # still open
+    del fake.positions[pos.position_id]  # IG's stop fired
+    assert broker.sync([pos], {"US500": quote}, OPEN) == []  # first miss: look once more before believing it
+    fake.activities = [{"details": {"level": 7575.3, "actions": [{"actionType": "POSITION_CLOSED", "affectedDealId": pos.position_id}]}}]
+    closure, = broker.sync([pos], {"US500": quote}, OPEN)
+    assert (closure.reason, closure.price) == ("stop-loss", 7575.3)  # the real level, slippage included
+    fake.activities[0]["details"]["level"] = 7624.5
+    assert broker.sync([pos], {"US500": quote}, OPEN)[0].reason == "take-profit"
+    fake.activities = []  # no record yet: after a few looks, book it at the level that must have triggered
+    assert broker.sync([pos], {"US500": Quote("US500", 7570, 7570.4, OPEN)}, OPEN)[0].reason == "stop-loss (estimated)"
+    # closing a position IG has already closed falls back to the activity record
+    fake.activities = [{"details": {"level": 7575.3, "actions": [{"actionType": "POSITION_CLOSED", "affectedDealId": pos.position_id}]}}]
+    assert broker.close(pos, quote, "time limit").price == 7575.3
+    fake.activities = []
+    with pytest.raises(BrokerError):
+        broker.close(pos, quote, "time limit")
+
+
+def ig_minute(engine, feed, fake, i, price):
+    t = OPEN + timedelta(minutes=i)
+    fake.price(price + 3.0)
+    engine.on_quotes(t, feed.quotes(t))
+    fake.price(price)
+    engine.on_quotes(t + timedelta(seconds=30), feed.quotes(t + timedelta(seconds=30)))
+
+
+def ig_session(cfg, budget):
+    fake, _, feed, broker = ig(cfg)
+    engine = DayEngine(cfg, broker, DayState(budget=budget))
+    for i in range(69):
+        ig_minute(engine, feed, fake, i, 7600 + (-1) ** i)
+    ig_minute(engine, feed, fake, 69, 7585.0)  # a sharp drop
+    ig_minute(engine, feed, fake, 70, 7585.0)
+    return fake, feed, engine
+
+
+def test_engine_trades_ig_end_to_end_with_a_funded_account(cfg):
+    fake, feed, engine = ig_session(cfg, budget=10_000.0)
+    pos, = engine.state.positions
+    assert len(fake.positions) == 1 and pos.position_id == "DIAAAA1" and pos.units >= 0.5
+    assert (pos.entry - pos.stop) * pos.units <= 25.5 and pos.entry - pos.stop >= 4.0  # £25 risk, IG's stop distance
+    assert pos.margin == pytest.approx(pos.amount * 0.05, rel=1e-6)
+    ig_minute(engine, feed, fake, 71, 7600.0)
+    ig_minute(engine, feed, fake, 72, 7600.0)
+    assert fake.positions == {} and engine.state.positions == []
+    sell = engine.trades[-1]
+    assert sell["reason"] == "back to average" and sell["currency"] == "£" and sell["pnl"] == pytest.approx(engine.state.realized)
+    assert 5 < engine.state.realized < 25  # about 15 points x £1 a point
+
+
+def test_precheck_and_runner_warn_when_nothing_can_be_traded(cfg, caplog):
+    fake, _, feed, broker = ig(cfg)
+    engine = DayEngine(cfg, broker, DayState(budget=50.0))
+    blocked = engine.precheck(feed.quotes(OPEN))
+    assert "smallest trade" in blocked["US500"] and "£3,800" in blocked["US500"]
+    assert DayEngine(cfg, broker, DayState(budget=10_000.0)).precheck(feed.quotes(OPEN)) == {}
+    fake.markets[US500]["instrument"]["marginFactor"] = 20  # a market needing 20% margin: £760 for the smallest bet
+    broker.details("US500", refresh=True)
+    loose = DayConfig(broker="ig", symbols=["US500"], risk_per_trade_pct=0.02, state_dir=cfg.state_dir).validate()
+    assert "margin" in DayEngine(loose, broker, DayState(budget=300.0)).precheck(feed.quotes(OPEN))["US500"]
+    fake.markets[US500]["instrument"]["marginFactor"] = 5
+    broker.details("US500", refresh=True)
+    now = [OPEN + timedelta(minutes=1)]
+
+    def sleep(seconds):
+        now[0] += timedelta(seconds=seconds)
+
+    feed.history = lambda name, minutes=80: []
+    with caplog.at_level("WARNING"):
+        run(cfg, engine, feed, sleep=sleep, clock=lambda: now[0], max_loops=3)
+    assert "NOTHING CAN BE TRADED" in caplog.text and not any(c[0] == "open" for c in fake.calls)
+
+
+def test_engine_refuses_ig_trades_on_a_fifty_pound_account(cfg):
+    fake, feed, engine = ig_session(cfg, budget=50.0)
+    assert fake.positions == {} and not any(c[0] == "open" for c in fake.calls)
+    assert "smallest trade" in engine.blocked["US500"] and "£3,79" in engine.blocked["US500"]  # 0.5 x 7,585 points
+
+
+def test_check_command_tells_a_small_account_the_truth(cfg, monkeypatch, capsys):
+    import trading_bot.day.cli as cli
+
+    fake, client, feed, broker = ig(cfg)
+    monkeypatch.setattr(cli, "_ig", lambda c: (client, feed, broker))
+    for name in ("DAY_BROKER", "DAY_PRESET", "DAY_SYMBOLS", "DAY_BUDGET_GBP"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DAY_SYMBOLS", "US500")
+    args = SimpleNamespace(preset=None, broker="ig", dry_run=False, real=False, budget=None)
+    cli.cmd_check(args)
+    out = capsys.readouterr().out
+    assert "spread betting account SB1" in out and "TOO BIG for this budget" in out and "cannot trade any" in out
+    args.budget = 10_000.0
+    cli.cmd_check(args)
+    out = capsys.readouterr().out
+    assert "->  OK" in out and "1 of 1 markets can be traded" in out
