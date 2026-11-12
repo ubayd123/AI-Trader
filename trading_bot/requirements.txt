@@ -1,0 +1,5 @@
+yfinance>=0.2.30
+pandas>=2.0
+requests>=2.31.0
+anthropic>=1.0  # optional: only needed for the Claude advisor
+pytest>=8.0.0

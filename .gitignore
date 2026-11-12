@@ -133,3 +133,10 @@ change.md
 
 # Local agent config symlink
 .codex
+
+# ====================
+# Trading bot local state
+# ====================
+trading_bot/data/
+__pycache__/
+.pytest_cache/

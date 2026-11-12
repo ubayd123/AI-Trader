@@ -142,6 +142,7 @@ If `DATABASE_URL` is set, PostgreSQL is used and `DB_PATH` is ignored.
 AI-Trader (GitHub - Open Source)
 ├── skills/              # Agent skill definitions
 ├── docs/api/            # OpenAPI specifications
+├── trading_bot/         # Small-account (£50) AI trading bot for UK users
 ├── service/             # Backend & frontend
 │   ├── server/         # FastAPI backend
 │   └── frontend/        # React frontend
