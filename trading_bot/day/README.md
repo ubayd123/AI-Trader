@@ -13,17 +13,23 @@ Read this first:
 ## IG and a small account
 
 IG's trading API only works with spread betting and CFD accounts, which are leveraged. It does not
-work with IG share dealing or ISA accounts. IG's minimum bet sizes, from IG's own pages:
+work with IG share dealing or ISA accounts. IG's published minimum bet sizes, at prices on
+12 November 2026:
 
 | Market | Smallest bet | What that controls | Margin IG holds | A 0.17% move against you |
 |---|---|---|---|---|
-| US 500 | £0.50 a point | about £3,800 | about £190 | about £6.50 |
-| US 500, first 31 days of a new account | £0.13 a point | about £990 | about £50 | about £1.70 |
-| Apple | £0.06 a point | about £2,100 | about £420 | about £3.60 |
+| FTSE 100 | £0.50 a point | about £5,400 | about £270 | about £9.20 |
+| GBP/USD | £0.50 a point | about £6,600 | about £220 | about £11.30 |
+| Apple | £0.06 a point | about £2,100 | about £430 | about £3.60 |
+| FTSE 100, first 31 days of a new account | £0.13 a point | about £1,400 | about £70 | about £2.40 |
 
-With £50, the standard minimum needs more margin than the whole account, so IG would refuse the order.
-Even with the first-month reduced minimum, one ordinary stop-out costs more than a 2% daily loss limit
-(£1). For the bot's default rule of risking 0.25% per trade, the US 500 needs roughly £2,600.
+With £50 you do not have the margin for any of these, so IG would refuse the order. That includes the
+reduced sizes IG gives new accounts for their first 31 days. And one ordinary stop-out on the smallest
+bet costs several times a 2% daily loss limit (£1).
+
+The bot assumes the US 500 has the same £0.50 minimum as the FTSE (about £3,800 of exposure, £190 of
+margin). At its default of risking 0.25% per trade, that market needs an account of roughly £2,600.
+`day check` reads the real minimums for your account from IG.
 
 Your choices:
 
@@ -53,7 +59,7 @@ python -m trading_bot day status                     # the bot's ledger
 python -m trading_bot day flatten                    # close everything the bot holds, now
 ```
 
-The bot trades 14:40 to 20:40 UK time on weekdays (the US session). Outside those hours it waits.
+The bot trades the US session on weekdays, usually 14:40 to 20:40 UK time. Outside those hours it waits.
 Ctrl+C stops it and closes its positions. Real money: add `--real --confirm-live`. Without both flags
 it refuses.
 
