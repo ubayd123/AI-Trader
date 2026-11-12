@@ -118,7 +118,7 @@ def cmd_register(cfg, args):
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="trading_bot", description="£50 AI trading bot (UK)")
+    parser = argparse.ArgumentParser(prog="trading_bot", description="£50 AI trading bot (UK): swing mode, and `day` for rapid eToro trading")
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
     for name, fn, text in (("run", cmd_run, "run one trading cycle"), ("loop", cmd_loop, "run cycles forever")):
@@ -138,6 +138,10 @@ def main(argv=None) -> int:
     p.add_argument("name")
     p.set_defaults(fn=cmd_register)
 
+    from .day.cli import add_parser as add_day_parser
+
+    add_day_parser(sub)
+
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(message)s",
                         datefmt="%H:%M:%S")
@@ -146,7 +150,10 @@ def main(argv=None) -> int:
     load_dotenv(Path("trading_bot/.env"))
     load_dotenv(Path(".env"))
     try:
-        args.fn(Config.from_env(), args)
+        if args.command == "day":
+            args.fn(args)
+        else:
+            args.fn(Config.from_env(), args)
     except KeyboardInterrupt:
         print("\nStopped.")
     except Exception as exc:

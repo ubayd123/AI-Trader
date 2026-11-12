@@ -140,3 +140,8 @@ change.md
 trading_bot/data/
 __pycache__/
 .pytest_cache/
+
+# ====================
+# Day Trader skill working files (your config and state)
+# ====================
+trader/
